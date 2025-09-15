@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/lorenzodonini/ocpp-go/ocpp"
-	ocpp16 "github.com/lorenzodonini/ocpp-go/ocpp1.6"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/types"
 	"github.com/lorenzodonini/ocpp-go/ocppj"
@@ -46,7 +45,7 @@ func main() {
 	}
 
 	// Create OCPP server using transport interface
-	server := ocppj.NewServerWithTransport(redisTransport, nil, nil, ocpp16.Profile)
+	server := ocppj.NewServerWithTransport(redisTransport, nil, nil, core.Profile)
 
 	// Set up handlers using transport-compatible setters
 	server.SetTransportRequestHandler(func(clientID string, request ocpp.Request, requestId string, action string) {
@@ -55,25 +54,27 @@ func main() {
 		switch req := request.(type) {
 		case *core.BootNotificationRequest:
 			// Respond to boot notification
-			response := core.NewBootNotificationResponse(types.RegistrationStatusAccepted, time.Now(), 300)
+			currentTime := types.NewDateTime(time.Now())
+			response := core.NewBootNotificationConfirmation(currentTime, 300, core.RegistrationStatusAccepted)
 			if err := server.SendResponse(clientID, requestId, response); err != nil {
 				log.Printf("Error sending response: %v", err)
 			}
 		case *core.HeartbeatRequest:
 			// Respond to heartbeat
-			response := core.NewHeartbeatResponse(time.Now())
+			currentTime := types.NewDateTime(time.Now())
+			response := core.NewHeartbeatConfirmation(currentTime)
 			if err := server.SendResponse(clientID, requestId, response); err != nil {
 				log.Printf("Error sending response: %v", err)
 			}
 		case *core.StatusNotificationRequest:
 			// Respond to status notification
-			response := core.NewStatusNotificationResponse()
+			response := core.NewStatusNotificationConfirmation()
 			if err := server.SendResponse(clientID, requestId, response); err != nil {
 				log.Printf("Error sending response: %v", err)
 			}
 		default:
 			log.Printf("Unsupported request type: %T", req)
-			if err := server.SendError(clientID, requestId, ocpp.NotSupported, "Request not supported", nil); err != nil {
+			if err := server.SendError(clientID, requestId, "NotSupported", "Request not supported", nil); err != nil {
 				log.Printf("Error sending error response: %v", err)
 			}
 		}

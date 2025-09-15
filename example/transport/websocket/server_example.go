@@ -45,7 +45,7 @@ func main() {
 	}
 
 	// Create OCPP server using transport interface
-	server := ocppj.NewServerWithTransport(wsTransport, nil, nil, ocpp16.Profile)
+	server := ocppj.NewServerWithTransport(wsTransport, nil, nil, core.Profile)
 
 	// Set up handlers using transport-compatible setters
 	server.SetTransportRequestHandler(func(clientID string, request ocpp.Request, requestId string, action string) {

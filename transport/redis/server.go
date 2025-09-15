@@ -121,12 +121,36 @@ func (rst *RedisServerTransport) Write(clientID string, data []byte) error {
 		return transport.ErrClientNotFound
 	}
 
-	// Parse the message to get message ID for correlation
-	var envelope MessageEnvelope
-	if err := json.Unmarshal(data, &envelope); err == nil {
-		envelope.ChargePointID = clientID
-		envelope.Timestamp = time.Now()
-		data, _ = json.Marshal(envelope)
+	// Create envelope for the OCPP response
+	var ocppMessage []interface{}
+	if err := json.Unmarshal(data, &ocppMessage); err != nil {
+		return fmt.Errorf("failed to parse OCPP message: %w", err)
+	}
+
+	// Extract message ID and type from OCPP-J message
+	var messageID string
+	var messageType int
+	if len(ocppMessage) >= 2 {
+		if msgType, ok := ocppMessage[0].(float64); ok {
+			messageType = int(msgType)
+		}
+		if msgID, ok := ocppMessage[1].(string); ok {
+			messageID = msgID
+		}
+	}
+
+	envelope := MessageEnvelope{
+		ChargePointID: clientID,
+		MessageType:   messageType,
+		MessageID:     messageID,
+		Payload:       ocppMessage,
+		Timestamp:     time.Now(),
+		WSServerID:    "redis-ocpp-server", // Identify this as coming from the Redis OCPP server
+	}
+
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("failed to marshal response envelope: %w", err)
 	}
 
 	// Publish to client-specific response queue
@@ -342,7 +366,14 @@ func (rst *RedisServerTransport) consumeRequest(ctx context.Context) {
 	rst.mu.RUnlock()
 
 	if handler != nil {
-		if err := handler(envelope.ChargePointID, []byte(message)); err != nil {
+		// Extract the OCPP-J payload from the envelope
+		payloadBytes, err := json.Marshal(envelope.Payload)
+		if err != nil {
+			rst.reportError(fmt.Errorf("failed to marshal OCPP payload for client %s: %w", envelope.ChargePointID, err))
+			return
+		}
+
+		if err := handler(envelope.ChargePointID, payloadBytes); err != nil {
 			rst.reportError(fmt.Errorf("message handler error for client %s: %w", envelope.ChargePointID, err))
 		}
 	}

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/lorenzodonini/ocpp-go/ocpp"
-	ocpp16 "github.com/lorenzodonini/ocpp-go/ocpp1.6"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/types"
 	"github.com/lorenzodonini/ocpp-go/ocppj"
@@ -47,7 +46,7 @@ func main() {
 	}
 
 	// Create OCPP client using transport interface
-	client := ocppj.NewClientWithTransport(clientID, redisTransport, nil, nil, ocpp16.Profile)
+	client := ocppj.NewClientWithTransport(clientID, redisTransport, nil, nil, core.Profile)
 
 	// Set up response handlers
 	client.SetResponseHandler(func(response ocpp.Response, requestId string) {
@@ -78,13 +77,13 @@ func main() {
 				{Key: "HeartbeatInterval", Readonly: false, Value: stringPtr("300")},
 				{Key: "MeterValueSampleInterval", Readonly: false, Value: stringPtr("60")},
 			}
-			response := core.NewGetConfigurationResponse(configKeys)
+			response := core.NewGetConfigurationConfirmation(configKeys)
 			if err := client.SendResponse(requestId, response); err != nil {
 				log.Printf("Error sending response: %v", err)
 			}
 		default:
 			log.Printf("Unsupported request type: %T", req)
-			if err := client.SendError(requestId, ocpp.NotSupported, "Request not supported", nil); err != nil {
+			if err := client.SendError(requestId, "NotSupported", "Request not supported", nil); err != nil {
 				log.Printf("Error sending error response: %v", err)
 			}
 		}

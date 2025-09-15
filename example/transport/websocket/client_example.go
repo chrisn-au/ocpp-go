@@ -41,7 +41,7 @@ func main() {
 	}
 
 	// Create OCPP client using transport interface
-	client := ocppj.NewClientWithTransport(clientID, wsTransport, nil, nil, ocpp16.Profile)
+	client := ocppj.NewClientWithTransport(clientID, wsTransport, nil, nil, core.Profile)
 
 	// Set up response handlers
 	client.SetResponseHandler(func(response ocpp.Response, requestId string) {
