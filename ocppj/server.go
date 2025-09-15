@@ -1,12 +1,18 @@
 package ocppj
 
 import (
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 
+	"github.com/gorilla/websocket"
 	"gopkg.in/go-playground/validator.v9"
 
 	"github.com/lorenzodonini/ocpp-go/ocpp"
+	"github.com/lorenzodonini/ocpp-go/transport"
 	"github.com/lorenzodonini/ocpp-go/ws"
 )
 
@@ -14,7 +20,8 @@ import (
 // During message exchange, the two roles may be reversed (depending on the message direction), but a server struct remains associated to a central system.
 type Server struct {
 	Endpoint
-	server                    ws.Server
+	server                    ws.Server            // Keep for backward compatibility
+	transport                 transport.Transport  // New transport interface
 	checkClientHandler        ws.CheckClientHandler
 	newClientHandler          ClientHandler
 	disconnectedClientHandler ClientHandler
@@ -32,6 +39,53 @@ type ResponseHandler func(client ws.Channel, response ocpp.Response, requestId s
 type ErrorHandler func(client ws.Channel, err *ocpp.Error, details interface{})
 type InvalidMessageHook func(client ws.Channel, err *ocpp.Error, rawJson string, parsedFields []interface{}) *ocpp.Error
 
+// Transport-compatible handler types
+type TransportClientHandler func(clientID string)
+type TransportRequestHandler func(clientID string, request ocpp.Request, requestId string, action string)
+type TransportResponseHandler func(clientID string, response ocpp.Response, requestId string)
+type TransportErrorHandler func(clientID string, err *ocpp.Error, details interface{})
+type TransportInvalidMessageHook func(clientID string, err *ocpp.Error, rawJson string, parsedFields []interface{}) *ocpp.Error
+
+// NewServerWithTransport creates a new Server endpoint with transport abstraction.
+// This is the recommended constructor for new implementations as it supports
+// multiple transport types (WebSocket, Redis, etc.) through the transport interface.
+//
+// You may create a simple new server by using these default values:
+//
+//	transport := websocket.NewWebSocketTransport()
+//	s := ocppj.NewServerWithTransport(transport, nil, nil)
+//
+// The dispatcher's associated ClientState will be set during initialization.
+func NewServerWithTransport(transport transport.Transport, dispatcher ServerDispatcher, stateHandler ServerState, profiles ...*ocpp.Profile) *Server {
+	if dispatcher == nil {
+		dispatcher = NewDefaultServerDispatcher(NewFIFOQueueMap(0))
+	}
+	if stateHandler == nil {
+		d, ok := dispatcher.(*DefaultServerDispatcher)
+		if !ok {
+			stateHandler = NewServerState(nil)
+		} else {
+			stateHandler = d.pendingRequestState
+		}
+	}
+	if transport == nil {
+		panic("transport parameter cannot be nil")
+	}
+
+	// For transport-based servers, we create a mock websocket server for dispatcher compatibility
+	// This maintains the existing dispatcher interface while using the new transport
+	mockWsServer := &mockWebSocketServer{transport: transport}
+	dispatcher.SetNetworkServer(mockWsServer)
+	dispatcher.SetPendingRequestState(stateHandler)
+
+	// Create server and add profiles
+	s := Server{Endpoint: Endpoint{}, transport: transport, RequestState: stateHandler, dispatcher: dispatcher}
+	for _, profile := range profiles {
+		s.AddProfile(profile)
+	}
+	return &s
+}
+
 // Creates a new Server endpoint.
 // Requires a a websocket server. Optionally a structure for queueing/dispatching requests,
 // a custom state handler and a list of profiles may be passed.
@@ -41,6 +95,9 @@ type InvalidMessageHook func(client ws.Channel, err *ocpp.Error, rawJson string,
 //	s := ocppj.NewServer(ws.NewServer(), nil, nil)
 //
 // The dispatcher's associated ClientState will be set during initialization.
+//
+// Deprecated: Use NewServerWithTransport for new implementations. This constructor
+// is maintained for backward compatibility but lacks the flexibility of the transport abstraction.
 func NewServer(wsServer ws.Server, dispatcher ServerDispatcher, stateHandler ServerState, profiles ...*ocpp.Profile) *Server {
 	if dispatcher == nil {
 		dispatcher = NewDefaultServerDispatcher(NewFIFOQueueMap(0))
@@ -120,13 +177,91 @@ func (s *Server) SetDisconnectedClientHandler(handler ClientHandler) {
 	s.disconnectedClientHandler = handler
 }
 
+// Transport-compatible handler setters for new transport interface
+// These are used when the server is created with NewServerWithTransport
+
+// SetTransportRequestHandler registers a handler for incoming requests (transport-compatible).
+// This handler receives the client ID as a string instead of a ws.Channel.
+func (s *Server) SetTransportRequestHandler(handler TransportRequestHandler) {
+	s.requestHandler = func(client ws.Channel, request ocpp.Request, requestId string, action string) {
+		handler(client.ID(), request, requestId, action)
+	}
+}
+
+// SetTransportResponseHandler registers a handler for incoming responses (transport-compatible).
+func (s *Server) SetTransportResponseHandler(handler TransportResponseHandler) {
+	s.responseHandler = func(client ws.Channel, response ocpp.Response, requestId string) {
+		handler(client.ID(), response, requestId)
+	}
+}
+
+// SetTransportErrorHandler registers a handler for incoming error messages (transport-compatible).
+func (s *Server) SetTransportErrorHandler(handler TransportErrorHandler) {
+	s.errorHandler = func(client ws.Channel, err *ocpp.Error, details interface{}) {
+		handler(client.ID(), err, details)
+	}
+}
+
+// SetTransportInvalidMessageHook registers an optional hook for invalid messages (transport-compatible).
+func (s *Server) SetTransportInvalidMessageHook(hook TransportInvalidMessageHook) {
+	s.invalidMessageHook = func(client ws.Channel, err *ocpp.Error, rawJson string, parsedFields []interface{}) *ocpp.Error {
+		return hook(client.ID(), err, rawJson, parsedFields)
+	}
+}
+
+// SetTransportNewClientHandler registers a handler for incoming client connections (transport-compatible).
+func (s *Server) SetTransportNewClientHandler(handler TransportClientHandler) {
+	s.newClientHandler = func(client ws.Channel) {
+		handler(client.ID())
+	}
+}
+
+// SetTransportDisconnectedClientHandler registers a handler for client disconnections (transport-compatible).
+func (s *Server) SetTransportDisconnectedClientHandler(handler TransportClientHandler) {
+	s.disconnectedClientHandler = func(client ws.Channel) {
+		handler(client.ID())
+	}
+}
+
+// StartWithTransport starts the server using the configured transport interface.
+// This method should be used when the server was created with NewServerWithTransport.
+// The config parameter should match the transport type (WebSocketConfig, RedisConfig, etc.).
+//
+// The function runs indefinitely, until the server is stopped.
+// Invoke this function in a separate goroutine, to perform other operations on the main thread.
+//
+// An error may be returned, if the transport couldn't be started.
+func (s *Server) StartWithTransport(ctx context.Context, config transport.Config) error {
+	if s.transport == nil {
+		return fmt.Errorf("server was not configured with transport interface, use Start() method instead")
+	}
+
+	// Set transport handlers
+	s.transport.SetMessageHandler(s.transportMessageHandler)
+	s.transport.SetConnectionHandler(s.onTransportClientConnected)
+	s.transport.SetDisconnectionHandler(s.onTransportClientDisconnected)
+	s.transport.SetErrorHandler(s.onTransportError)
+
+	s.dispatcher.Start()
+
+	// Start the transport
+	return s.transport.Start(ctx, config)
+}
+
 // Starts the underlying Websocket server on a specified listenPort and listenPath.
 //
 // The function runs indefinitely, until the server is stopped.
 // Invoke this function in a separate goroutine, to perform other operations on the main thread.
 //
 // An error may be returned, if the websocket server couldn't be started.
+//
+// Deprecated: Use StartWithTransport for new implementations when using transport abstraction.
+// This method is maintained for backward compatibility with existing WebSocket-based code.
 func (s *Server) Start(listenPort int, listenPath string) {
+	if s.server == nil {
+		panic("server was not configured with WebSocket server, use StartWithTransport() method instead")
+	}
+
 	// Set internal message handler
 	s.server.SetCheckClientHandler(s.checkClientHandler)
 	s.server.SetNewClientHandler(s.onClientConnected)
@@ -138,11 +273,28 @@ func (s *Server) Start(listenPort int, listenPath string) {
 	// TODO: return error?
 }
 
+// StopWithTransport stops the server using the configured transport interface.
+// This method should be used when the server was started with StartWithTransport.
+func (s *Server) StopWithTransport(ctx context.Context) error {
+	if s.transport == nil {
+		return fmt.Errorf("server was not configured with transport interface")
+	}
+
+	s.dispatcher.Stop()
+	return s.transport.Stop(ctx)
+}
+
 // Stops the server.
 // This clears all pending requests and causes the Start function to return.
 func (s *Server) Stop() {
 	s.dispatcher.Stop()
-	s.server.Stop()
+	if s.server != nil {
+		s.server.Stop()
+	}
+	if s.transport != nil {
+		// Use a background context for backward compatibility
+		_ = s.transport.Stop(context.Background())
+	}
 }
 
 // Sends an OCPP Request to a client, identified by the clientID parameter.
@@ -196,7 +348,17 @@ func (s *Server) SendResponse(clientID string, requestId string, response ocpp.R
 	if err != nil {
 		return ocpp.NewError(GenericError, err.Error(), requestId)
 	}
-	if err = s.server.Write(clientID, jsonMessage); err != nil {
+
+	// Use transport interface if available, otherwise fall back to WebSocket
+	if s.transport != nil {
+		err = s.transport.Write(clientID, jsonMessage)
+	} else if s.server != nil {
+		err = s.server.Write(clientID, jsonMessage)
+	} else {
+		return fmt.Errorf("no transport or server configured")
+	}
+
+	if err != nil {
 		log.Errorf("error sending response [%s] to %s: %v", callResult.GetUniqueId(), clientID, err)
 		return ocpp.NewError(GenericError, err.Error(), requestId)
 	}
@@ -222,7 +384,17 @@ func (s *Server) SendError(clientID string, requestId string, errorCode ocpp.Err
 	if err != nil {
 		return ocpp.NewError(GenericError, err.Error(), requestId)
 	}
-	if err = s.server.Write(clientID, jsonMessage); err != nil {
+
+	// Use transport interface if available, otherwise fall back to WebSocket
+	if s.transport != nil {
+		err = s.transport.Write(clientID, jsonMessage)
+	} else if s.server != nil {
+		err = s.server.Write(clientID, jsonMessage)
+	} else {
+		return fmt.Errorf("no transport or server configured")
+	}
+
+	if err != nil {
 		log.Errorf("error sending response error [%s] to %s: %v", callError.UniqueId, clientID, err)
 		return ocpp.NewError(GenericError, err.Error(), requestId)
 	}
@@ -336,4 +508,157 @@ func (s *Server) onClientDisconnected(ws ws.Channel) {
 	if s.disconnectedClientHandler != nil {
 		s.disconnectedClientHandler(ws)
 	}
+}
+
+// Transport-specific handlers for new transport interface
+
+func (s *Server) transportMessageHandler(clientID string, data []byte) error {
+	// Create a mock ws.Channel to maintain compatibility with existing handlers
+	// In a full implementation, you might want to create a proper adapter
+	mockChannel := &mockChannel{id: clientID}
+	return s.ocppMessageHandler(mockChannel, data)
+}
+
+func (s *Server) onTransportClientConnected(clientID string) {
+	// Create state for connected client
+	s.dispatcher.CreateClient(clientID)
+	// Invoke callback with mock channel
+	if s.newClientHandler != nil {
+		mockChannel := &mockChannel{id: clientID}
+		s.newClientHandler(mockChannel)
+	}
+}
+
+func (s *Server) onTransportClientDisconnected(clientID string, err error) {
+	// Clear state for disconnected client
+	s.dispatcher.DeleteClient(clientID)
+	s.RequestState.ClearClientPendingRequest(clientID)
+	// Invoke callback with mock channel
+	if s.disconnectedClientHandler != nil {
+		mockChannel := &mockChannel{id: clientID}
+		s.disconnectedClientHandler(mockChannel)
+	}
+}
+
+func (s *Server) onTransportError(clientID string, err error) {
+	log.Errorf("transport error for client %s: %v", clientID, err)
+}
+
+// mockChannel is a minimal implementation of ws.Channel to maintain compatibility
+// with existing WebSocket-based handlers when using transport interface
+type mockChannel struct {
+	id string
+}
+
+func (m *mockChannel) ID() string {
+	return m.id
+}
+
+func (m *mockChannel) Write(data []byte) error {
+	// This should not be called when using transport interface
+	// as writes go through the transport interface directly
+	return fmt.Errorf("write not supported on mock channel, use transport interface")
+}
+
+func (m *mockChannel) Close() error {
+	// This should not be called when using transport interface
+	return fmt.Errorf("close not supported on mock channel, use transport interface")
+}
+
+func (m *mockChannel) IsConnected() bool {
+	// This is a best-effort implementation for compatibility
+	return true
+}
+
+func (m *mockChannel) RemoteAddr() net.Addr {
+	// Return a mock address for compatibility
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+func (m *mockChannel) TLSConnectionState() *tls.ConnectionState {
+	// Return nil for mock implementation
+	return nil
+}
+
+// mockWebSocketServer is a minimal implementation of ws.Server to maintain compatibility
+// with existing dispatchers when using transport interface
+type mockWebSocketServer struct {
+	transport transport.Transport
+}
+
+func (m *mockWebSocketServer) Start(port int, listenPath string) {
+	// This should not be called when using transport interface
+	log.Errorf("mockWebSocketServer.Start called - this is not supported with transport interface")
+}
+
+func (m *mockWebSocketServer) Stop() {
+	// This should not be called when using transport interface
+	log.Errorf("mockWebSocketServer.Stop called - this is not supported with transport interface")
+}
+
+func (m *mockWebSocketServer) GetChannel(id string) (ws.Channel, bool) {
+	// Return a mock channel for compatibility
+	mockChannel := &mockChannel{id: id}
+	return mockChannel, true
+}
+
+func (m *mockWebSocketServer) StopConnection(id string, closeError websocket.CloseError) error {
+	// This should not be called when using transport interface
+	return fmt.Errorf("StopConnection not supported on mock server")
+}
+
+func (m *mockWebSocketServer) Errors() <-chan error {
+	// Return an empty error channel
+	errorChan := make(chan error)
+	close(errorChan)
+	return errorChan
+}
+
+func (m *mockWebSocketServer) SetTimeoutConfig(config ws.ServerTimeoutConfig) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketServer) Write(clientID string, data []byte) error {
+	// Delegate to the transport interface
+	if m.transport != nil {
+		return m.transport.Write(clientID, data)
+	}
+	return fmt.Errorf("no transport configured")
+}
+
+func (m *mockWebSocketServer) AddSupportedSubprotocol(subProto string) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketServer) SetChargePointIdResolver(resolver func(r *http.Request) (string, error)) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketServer) SetBasicAuthHandler(handler func(username string, password string) bool) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketServer) SetCheckOriginHandler(handler func(r *http.Request) bool) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketServer) SetMessageHandler(handler ws.MessageHandler) {
+	// This is handled by the transport interface
+}
+
+func (m *mockWebSocketServer) SetNewClientHandler(handler ws.ConnectedHandler) {
+	// This is handled by the transport interface
+}
+
+func (m *mockWebSocketServer) SetDisconnectedClientHandler(handler func(ws.Channel)) {
+	// This is handled by the transport interface
+}
+
+func (m *mockWebSocketServer) SetCheckClientHandler(handler ws.CheckClientHandler) {
+	// This is handled by the transport interface
+}
+
+func (m *mockWebSocketServer) Addr() *net.TCPAddr {
+	// Return a mock address
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
 }

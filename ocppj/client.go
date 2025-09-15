@@ -1,12 +1,14 @@
 package ocppj
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
 	"gopkg.in/go-playground/validator.v9"
 
 	"github.com/lorenzodonini/ocpp-go/ocpp"
+	"github.com/lorenzodonini/ocpp-go/transport"
 	"github.com/lorenzodonini/ocpp-go/ws"
 )
 
@@ -14,7 +16,8 @@ import (
 // During message exchange, the two roles may be reversed (depending on the message direction), but a client struct remains associated to a charge point/charging station.
 type Client struct {
 	Endpoint
-	client                ws.Client
+	client                ws.Client                      // Keep for backward compatibility
+	transport             transport.ClientTransport     // New transport interface
 	Id                    string
 	requestHandler        func(request ocpp.Request, requestId string, action string)
 	responseHandler       func(response ocpp.Response, requestId string)
@@ -24,6 +27,38 @@ type Client struct {
 	invalidMessageHook    func(err *ocpp.Error, rawMessage string, parsedFields []interface{}) *ocpp.Error
 	dispatcher            ClientDispatcher
 	RequestState          ClientState
+}
+
+// NewClientWithTransport creates a new Client endpoint with transport abstraction.
+// This is the recommended constructor for new implementations as it supports
+// multiple transport types (WebSocket, Redis, etc.) through the transport interface.
+//
+// You may create a simple new client by using these default values:
+//
+//	transport := websocket.NewWebSocketClientTransport()
+//	c := ocppj.NewClientWithTransport("client-id", transport, nil, nil)
+//
+// The transport parameter cannot be nil.
+func NewClientWithTransport(id string, transport transport.ClientTransport, dispatcher ClientDispatcher, stateHandler ClientState, profiles ...*ocpp.Profile) *Client {
+	endpoint := Endpoint{}
+	if transport == nil {
+		panic("transport parameter cannot be nil")
+	}
+	for _, profile := range profiles {
+		endpoint.AddProfile(profile)
+	}
+	if dispatcher == nil {
+		dispatcher = NewDefaultClientDispatcher(NewFIFOClientQueue(10))
+	}
+	if stateHandler == nil {
+		stateHandler = NewClientState()
+	}
+
+	// For transport-based clients, we create a mock websocket client for dispatcher compatibility
+	mockWsClient := &mockWebSocketClient{transport: transport}
+	dispatcher.SetNetworkClient(mockWsClient)
+	dispatcher.SetPendingRequestState(stateHandler)
+	return &Client{Endpoint: endpoint, transport: transport, Id: id, dispatcher: dispatcher, RequestState: stateHandler}
 }
 
 // Creates a new Client endpoint.
@@ -36,6 +71,9 @@ type Client struct {
 //
 // The wsClient parameter cannot be nil. Refer to the ws package for information on how to create and
 // customize a websocket client.
+//
+// Deprecated: Use NewClientWithTransport for new implementations. This constructor
+// is maintained for backward compatibility but lacks the flexibility of the transport abstraction.
 func NewClient(id string, wsClient ws.Client, dispatcher ClientDispatcher, stateHandler ClientState, profiles ...*ocpp.Profile) *Client {
 	endpoint := Endpoint{}
 	if wsClient == nil {
@@ -116,6 +154,35 @@ func (c *Client) SetOnRequestCanceled(handler func(requestId string, request ocp
 	c.dispatcher.SetOnRequestCanceled(handler)
 }
 
+// StartWithTransport connects to the server using the configured transport interface.
+// This method should be used when the client was created with NewClientWithTransport.
+// The endpoint format depends on the transport implementation.
+// The config parameter should match the transport type (WebSocketConfig, RedisConfig, etc.).
+//
+// If the connection is established successfully, the function returns control to the caller immediately.
+// The read/write routines are run on dedicated goroutines, so the main thread can perform other operations.
+//
+// An error may be returned, if establishing the connection failed.
+func (c *Client) StartWithTransport(ctx context.Context, endpoint string, config transport.Config) error {
+	if c.transport == nil {
+		return fmt.Errorf("client was not configured with transport interface, use Start() method instead")
+	}
+
+	// Set transport handlers
+	c.transport.SetMessageHandler(c.transportMessageHandler)
+	c.transport.SetDisconnectionHandler(c.onTransportDisconnected)
+	c.transport.SetReconnectionHandler(c.onTransportReconnected)
+	c.transport.SetErrorHandler(c.onTransportError)
+
+	// Connect & run
+	fullUrl := fmt.Sprintf("%v/%v", endpoint, c.Id)
+	err := c.transport.Start(ctx, fullUrl, config)
+	if err == nil {
+		c.dispatcher.Start()
+	}
+	return err
+}
+
 // Connects to the given serverURL and starts running the I/O loop for the underlying connection.
 //
 // If the connection is established successfully, the function returns control to the caller immediately.
@@ -125,7 +192,14 @@ func (c *Client) SetOnRequestCanceled(handler func(requestId string, request ocp
 // The client will attempt to re-connect to the server forever, until it is stopped by invoking the Stop method.
 //
 // An error may be returned, if establishing the connection failed.
+//
+// Deprecated: Use StartWithTransport for new implementations when using transport abstraction.
+// This method is maintained for backward compatibility with existing WebSocket-based code.
 func (c *Client) Start(serverURL string) error {
+	if c.client == nil {
+		return fmt.Errorf("client was not configured with WebSocket client, use StartWithTransport() method instead")
+	}
+
 	// Set internal message handler
 	c.client.SetMessageHandler(c.ocppMessageHandler)
 	c.client.SetDisconnectedHandler(c.onDisconnected)
@@ -139,7 +213,14 @@ func (c *Client) Start(serverURL string) error {
 	return err
 }
 
+// Deprecated: Use StartWithTransport for new implementations when using transport abstraction.
+// This method is maintained for backward compatibility with existing WebSocket-based code.
 func (c *Client) StartWithRetries(serverURL string) {
+	if c.client == nil {
+		log.Errorf("client was not configured with WebSocket client, use StartWithTransport() method instead")
+		return
+	}
+
 	// Set internal message handler
 	c.client.SetMessageHandler(c.ocppMessageHandler)
 	c.client.SetDisconnectedHandler(c.onDisconnected)
@@ -150,28 +231,59 @@ func (c *Client) StartWithRetries(serverURL string) {
 	c.dispatcher.Start()
 }
 
-// Stops the client.
-// The underlying I/O loop is stopped and all pending requests are cleared.
-func (c *Client) Stop() {
-	// Overwrite handler to intercept disconnected signal
-	cleanupC := make(chan struct{}, 1)
-	if c.IsConnected() {
-		c.client.SetDisconnectedHandler(func(err error) {
-			cleanupC <- struct{}{}
-		})
-	} else {
-		close(cleanupC)
+// StopWithTransport stops the client using the configured transport interface.
+// This method should be used when the client was started with StartWithTransport.
+func (c *Client) StopWithTransport(ctx context.Context) error {
+	if c.transport == nil {
+		return fmt.Errorf("client was not configured with transport interface")
 	}
-	c.client.Stop()
+
 	if c.dispatcher.IsRunning() {
 		c.dispatcher.Stop()
 	}
-	// Wait for websocket to be cleaned up
-	<-cleanupC
+	return c.transport.Stop(ctx)
+}
+
+// Stops the client.
+// The underlying I/O loop is stopped and all pending requests are cleared.
+func (c *Client) Stop() {
+	if c.transport != nil {
+		// Use transport interface if available
+		if c.dispatcher.IsRunning() {
+			c.dispatcher.Stop()
+		}
+		_ = c.transport.Stop(context.Background())
+		return
+	}
+
+	if c.client != nil {
+		// Use WebSocket client for backward compatibility
+		// Overwrite handler to intercept disconnected signal
+		cleanupC := make(chan struct{}, 1)
+		if c.IsConnected() {
+			c.client.SetDisconnectedHandler(func(err error) {
+				cleanupC <- struct{}{}
+			})
+		} else {
+			close(cleanupC)
+		}
+		c.client.Stop()
+		if c.dispatcher.IsRunning() {
+			c.dispatcher.Stop()
+		}
+		// Wait for websocket to be cleaned up
+		<-cleanupC
+	}
 }
 
 func (c *Client) IsConnected() bool {
-	return c.client.IsConnected()
+	if c.transport != nil {
+		return c.transport.IsConnected()
+	}
+	if c.client != nil {
+		return c.client.IsConnected()
+	}
+	return false
 }
 
 // Sends an OCPP Request to the server.
@@ -227,7 +339,17 @@ func (c *Client) SendResponse(requestId string, response ocpp.Response) error {
 	if err != nil {
 		return ocpp.NewError(GenericError, err.Error(), requestId)
 	}
-	if err = c.client.Write(jsonMessage); err != nil {
+
+	// Use transport interface if available, otherwise fall back to WebSocket
+	if c.transport != nil {
+		err = c.transport.Write(jsonMessage)
+	} else if c.client != nil {
+		err = c.client.Write(jsonMessage)
+	} else {
+		return fmt.Errorf("no transport or client configured")
+	}
+
+	if err != nil {
 		log.Errorf("error sending response [%s]: %v", callResult.GetUniqueId(), err)
 		return ocpp.NewError(GenericError, err.Error(), requestId)
 	}
@@ -253,7 +375,17 @@ func (c *Client) SendError(requestId string, errorCode ocpp.ErrorCode, descripti
 	if err != nil {
 		return ocpp.NewError(GenericError, err.Error(), requestId)
 	}
-	if err = c.client.Write(jsonMessage); err != nil {
+
+	// Use transport interface if available, otherwise fall back to WebSocket
+	if c.transport != nil {
+		err = c.transport.Write(jsonMessage)
+	} else if c.client != nil {
+		err = c.client.Write(jsonMessage)
+	} else {
+		return fmt.Errorf("no transport or client configured")
+	}
+
+	if err != nil {
 		log.Errorf("error sending response error [%s]: %v", callError.UniqueId, err)
 		return ocpp.NewError(GenericError, err.Error(), requestId)
 	}
@@ -359,4 +491,109 @@ func (c *Client) onReconnected() {
 		c.onReconnectedHandler()
 	}
 	c.dispatcher.Resume()
+}
+
+// Transport-specific handlers for new transport interface
+
+func (c *Client) transportMessageHandler(data []byte) error {
+	return c.ocppMessageHandler(data)
+}
+
+func (c *Client) onTransportDisconnected(err error) {
+	log.Error("disconnected from server", err)
+	c.dispatcher.Pause()
+	if c.onDisconnectedHandler != nil {
+		c.onDisconnectedHandler(err)
+	}
+}
+
+func (c *Client) onTransportReconnected() {
+	if c.onReconnectedHandler != nil {
+		c.onReconnectedHandler()
+	}
+	c.dispatcher.Resume()
+}
+
+func (c *Client) onTransportError(err error) {
+	log.Errorf("transport error: %v", err)
+}
+
+// mockWebSocketClient is a minimal implementation of ws.Client to maintain compatibility
+// with existing dispatchers when using transport interface
+type mockWebSocketClient struct {
+	transport transport.ClientTransport
+}
+
+func (m *mockWebSocketClient) Start(url string) error {
+	// This should not be called when using transport interface
+	return fmt.Errorf("Start not supported on mock client, use transport interface")
+}
+
+func (m *mockWebSocketClient) StartWithRetries(url string) {
+	// This should not be called when using transport interface
+	log.Errorf("StartWithRetries not supported on mock client, use transport interface")
+}
+
+func (m *mockWebSocketClient) Stop() {
+	// This should not be called when using transport interface
+	log.Errorf("Stop not supported on mock client, use transport interface")
+}
+
+func (m *mockWebSocketClient) Write(data []byte) error {
+	// Delegate to the transport interface
+	if m.transport != nil {
+		return m.transport.Write(data)
+	}
+	return fmt.Errorf("no transport configured")
+}
+
+func (m *mockWebSocketClient) SetMessageHandler(handler func([]byte) error) {
+	// This is handled by the transport interface
+}
+
+func (m *mockWebSocketClient) SetDisconnectedHandler(handler func(error)) {
+	// This is handled by the transport interface
+}
+
+func (m *mockWebSocketClient) SetReconnectedHandler(handler func()) {
+	// This is handled by the transport interface
+}
+
+func (m *mockWebSocketClient) IsConnected() bool {
+	// Delegate to the transport interface
+	if m.transport != nil {
+		return m.transport.IsConnected()
+	}
+	return false
+}
+
+func (m *mockWebSocketClient) Errors() <-chan error {
+	// Delegate to the transport interface
+	if m.transport != nil {
+		return m.transport.Errors()
+	}
+	// Return an empty error channel
+	errorChan := make(chan error)
+	close(errorChan)
+	return errorChan
+}
+
+func (m *mockWebSocketClient) SetTimeoutConfig(config ws.ClientTimeoutConfig) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketClient) AddOption(option interface{}) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketClient) SetRequestedSubProtocol(subProto string) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketClient) SetBasicAuth(username string, password string) {
+	// This is not supported with transport interface
+}
+
+func (m *mockWebSocketClient) SetHeaderValue(key string, value string) {
+	// This is not supported with transport interface
 }
