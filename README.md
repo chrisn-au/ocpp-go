@@ -30,6 +30,25 @@ go mod download
 
 Your application may either act as a **Central System** (server) or as a **Charge Point** (client).
 
+## Transport Options
+
+This library supports multiple transport layers:
+
+### WebSocket Transport (Default)
+The standard OCPP transport using WebSocket connections. This is the default and recommended transport for most use cases.
+
+### Redis Transport (Experimental)
+**⚠️ Early testing phase - use with caution in production environments**
+
+An experimental transport implementation that enables distributed OCPP processing using Redis pub/sub as the message bus. This allows for:
+- Horizontal scaling of OCPP servers
+- Separation of WebSocket connection handling from business logic
+- Message queuing and reliability features
+
+See [transport examples](example/transport/) for implementation details and usage patterns.
+
+**Note**: Redis transport is in early development and testing. While functional for basic OCPP message flows, it may not handle all edge cases and should be thoroughly tested before production use.
+
 ## Features and supported versions
 
 **Note: Releases 0.10.0 introduced breaking changes in some API, due to refactoring. The functionality remains the same,
