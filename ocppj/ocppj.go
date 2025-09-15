@@ -456,11 +456,18 @@ func (endpoint *Endpoint) ParseMessage(arr []interface{}, pendingRequestState Cl
 		}
 		return &call, nil
 	} else if typeId == CALL_RESULT {
+		log.Infof("DEBUG: Processing CALL_RESULT for uniqueId: %v", uniqueId)
 		request, ok := pendingRequestState.GetPendingRequest(uniqueId)
+		log.Infof("DEBUG: GetPendingRequest returned ok=%v, request=%v", ok, request)
 		if !ok {
 			log.Infof("No previous request %v sent. Discarding response message", uniqueId)
 			return nil, nil
 		}
+		if request == nil {
+			log.Errorf("DEBUG: request is nil even though ok=true for uniqueId: %v", uniqueId)
+			return nil, nil
+		}
+		log.Infof("DEBUG: request.GetFeatureName() about to be called")
 		profile, _ := endpoint.GetProfileForFeature(request.GetFeatureName())
 		confirmation, err := profile.ParseResponse(request.GetFeatureName(), arr[2], parseRawJsonConfirmation)
 		if err != nil {

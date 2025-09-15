@@ -208,6 +208,12 @@ type RedisConfig struct {
 	RetryAttempts int
 	// RetryDelay is the delay between retry attempts.
 	RetryDelay time.Duration
+	// UseDistributedState enables Redis-backed distributed state management.
+	UseDistributedState bool
+	// StateKeyPrefix is the prefix for Redis keys used for state storage.
+	StateKeyPrefix string
+	// StateTTL is the TTL for state entries in Redis.
+	StateTTL time.Duration
 }
 
 // GetType returns RedisTransport.
@@ -234,6 +240,12 @@ func (c *RedisConfig) Validate() error {
 	}
 	if c.RetryDelay <= 0 {
 		c.RetryDelay = time.Second
+	}
+	if c.StateKeyPrefix == "" {
+		c.StateKeyPrefix = "ocpp"
+	}
+	if c.StateTTL <= 0 {
+		c.StateTTL = 30 * time.Second
 	}
 	return nil
 }

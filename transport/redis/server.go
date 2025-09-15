@@ -7,9 +7,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lorenzodonini/ocpp-go/logging"
 	"github.com/lorenzodonini/ocpp-go/transport"
 	"github.com/go-redis/redis/v8"
 )
+
+// The internal verbose logger
+var log logging.Logger
+
+func init() {
+	log = &logging.VoidLogger{}
+}
 
 // RedisServerTransport implements the transport.Transport interface for Redis-based communication.
 type RedisServerTransport struct {
@@ -366,7 +374,7 @@ func (rst *RedisServerTransport) consumeRequest(ctx context.Context) {
 	rst.mu.RUnlock()
 
 	if handler != nil {
-		// Extract the OCPP-J payload from the envelope
+		// The payload contains the full OCPP-J message array [messageType, messageId, ...]
 		payloadBytes, err := json.Marshal(envelope.Payload)
 		if err != nil {
 			rst.reportError(fmt.Errorf("failed to marshal OCPP payload for client %s: %w", envelope.ChargePointID, err))

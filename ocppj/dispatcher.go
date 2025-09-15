@@ -592,7 +592,9 @@ func (d *DefaultServerDispatcher) dispatchNextRequest(clientID string) (clientCt
 	bundle, _ := el.(RequestBundle)
 	jsonMessage := bundle.Data
 	callID := bundle.Call.GetUniqueId()
+	fmt.Printf("DISPATCHER: Adding pending request for client %s with ID %s\n", clientID, callID)
 	d.pendingRequestState.AddPendingRequest(clientID, callID, bundle.Call.Payload)
+	fmt.Printf("DISPATCHER: Sending message to network: %s\n", string(jsonMessage))
 	err := d.network.Write(clientID, jsonMessage)
 	if err != nil {
 		log.Errorf("error while sending message: %v", err)

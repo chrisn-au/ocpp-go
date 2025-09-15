@@ -1,6 +1,13 @@
 package redis
 
 import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/go-redis/redis/v8"
+	"github.com/lorenzodonini/ocpp-go/ocppj"
 	"github.com/lorenzodonini/ocpp-go/transport"
 )
 
@@ -43,6 +50,50 @@ func (rf *RedisFactory) CreateClientTransport(config transport.Config) (transpor
 // SupportedTypes returns the transport types supported by this factory.
 func (rf *RedisFactory) SupportedTypes() []transport.TransportType {
 	return []transport.TransportType{transport.RedisTransport}
+}
+
+// CreateServerState creates a server state implementation based on configuration.
+// If distributed state is disabled, returns memory-based state.
+// If enabled, creates Redis-backed distributed state.
+func (rf *RedisFactory) CreateServerState(config *transport.RedisConfig) (ocppj.ServerState, error) {
+	if !config.UseDistributedState {
+		return ocppj.NewServerState(&sync.RWMutex{}), nil
+	}
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     config.Addr,
+		Password: config.Password,
+		DB:       config.DB + 1, // Use different DB for state
+	})
+
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("failed to connect to Redis for state: %w", err)
+	}
+
+	return ocppj.NewRedisServerState(redisClient, config.StateKeyPrefix, config.StateTTL), nil
+}
+
+// CreateBusinessState creates a Redis-backed business state manager
+func (rf *RedisFactory) CreateBusinessState(config *transport.RedisConfig) (*ocppj.RedisBusinessState, error) {
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     config.Addr,
+		Password: config.Password,
+		DB:       config.DB + 2, // Use different DB for business state (DB 0 = transport, DB 1 = request state, DB 2 = business state)
+	})
+
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("failed to connect to Redis for business state: %w", err)
+	}
+
+	return ocppj.NewRedisBusinessState(redisClient, config.StateKeyPrefix, 24*time.Hour), nil
 }
 
 // RegisterWithDefaultFactory registers the Redis factory with the default transport factory.
