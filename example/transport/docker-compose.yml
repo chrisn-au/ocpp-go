@@ -1,0 +1,80 @@
+services:
+  # Redis server for transport layer
+  redis:
+    image: redis:7-alpine
+    container_name: transport-redis
+    ports:
+      - "47001:6379"
+    networks:
+      - redis-ocpp-network
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # OCPP Server using Redis transport
+  ocpp-server:
+    build:
+      context: ../..
+      dockerfile: example/transport/redis/Dockerfile.server
+    container_name: transport-server
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=
+      - OCPP_CHANNEL_PREFIX=ocpp
+      - OCPP_CLIENT_TIMEOUT=30s
+      - OCPP_STATE_TTL=300s
+    networks:
+      - redis-ocpp-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "ps aux | grep redis-server || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # OCPP Client using Redis transport
+  ocpp-client:
+    build:
+      context: ../..
+      dockerfile: example/transport/redis/Dockerfile.client
+    container_name: transport-client
+    depends_on:
+      redis:
+        condition: service_healthy
+      ocpp-server:
+        condition: service_healthy
+    environment:
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=
+      - CLIENT_ID=CP-001
+      - OCPP_CHANNEL_PREFIX=ocpp
+      - OCPP_CLIENT_TIMEOUT=30s
+    networks:
+      - redis-ocpp-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "ps aux | grep redis-client || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+
+
+networks:
+  redis-ocpp-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
+
+# Health check script for testing the stack
+# Usage: docker-compose up -d && docker-compose logs -f

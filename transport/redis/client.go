@@ -275,23 +275,43 @@ func (rct *RedisClientTransport) consumeResponse(ctx context.Context, responseQu
 		return
 	}
 
-	// Try to handle as correlated response first
+	// Try to parse as MessageEnvelope first
 	var envelope MessageEnvelope
-	if err := json.Unmarshal([]byte(message), &envelope); err == nil && envelope.MessageID != "" {
-		// Check if this is a correlated response
-		if rct.correlationManager.CompleteRequest(envelope.MessageID, []byte(message)) == nil {
-			return // Successfully handled as correlated response
+	if err := json.Unmarshal([]byte(message), &envelope); err == nil {
+		// Extract the OCPP-J payload from the envelope
+		payloadBytes, err := json.Marshal(envelope.Payload)
+		if err != nil {
+			rct.reportError(fmt.Errorf("failed to marshal OCPP-J payload: %w", err))
+			return
 		}
-	}
 
-	// Handle as regular message
-	rct.mu.RLock()
-	handler := rct.messageHandler
-	rct.mu.RUnlock()
+		// Try to handle as correlated response first
+		if envelope.MessageID != "" {
+			if rct.correlationManager.CompleteRequest(envelope.MessageID, payloadBytes) == nil {
+				return // Successfully handled as correlated response
+			}
+		}
 
-	if handler != nil {
-		if err := handler([]byte(message)); err != nil {
-			rct.reportError(fmt.Errorf("message handler error: %w", err))
+		// Handle as regular message
+		rct.mu.RLock()
+		handler := rct.messageHandler
+		rct.mu.RUnlock()
+
+		if handler != nil {
+			if err := handler(payloadBytes); err != nil {
+				rct.reportError(fmt.Errorf("message handler error: %w", err))
+			}
+		}
+	} else {
+		// Fallback: handle as raw message (for backward compatibility)
+		rct.mu.RLock()
+		handler := rct.messageHandler
+		rct.mu.RUnlock()
+
+		if handler != nil {
+			if err := handler([]byte(message)); err != nil {
+				rct.reportError(fmt.Errorf("message handler error: %w", err))
+			}
 		}
 	}
 }

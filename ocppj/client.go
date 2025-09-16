@@ -175,8 +175,15 @@ func (c *Client) StartWithTransport(ctx context.Context, endpoint string, config
 	c.transport.SetErrorHandler(c.onTransportError)
 
 	// Connect & run
-	fullUrl := fmt.Sprintf("%v/%v", endpoint, c.Id)
-	err := c.transport.Start(ctx, fullUrl, config)
+	var endpointToUse string
+	if config.GetType() == transport.RedisTransport {
+		// For Redis transport, just use the client ID directly
+		endpointToUse = c.Id
+	} else {
+		// For WebSocket and other URL-based transports, construct full URL
+		endpointToUse = fmt.Sprintf("%v/%v", endpoint, c.Id)
+	}
+	err := c.transport.Start(ctx, endpointToUse, config)
 	if err == nil {
 		c.dispatcher.Start()
 	}

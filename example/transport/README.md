@@ -2,64 +2,80 @@
 
 This directory contains examples demonstrating how to use the OCPP-Go library with different transport implementations through the transport abstraction layer.
 
+## Directory Structure
+
+```
+transport/
+├── redis/
+│   ├── client/          # Redis transport client example
+│   │   ├── main.go      # Client implementation
+│   │   ├── Dockerfile   # Client Docker build
+│   │   └── README.md    # Client documentation
+│   ├── server/          # Redis transport server example
+│   │   ├── main.go      # Server implementation
+│   │   ├── Dockerfile   # Server Docker build
+│   │   └── README.md    # Server documentation
+│   └── README.md        # Redis transport overview
+├── docker-compose.yml   # Complete stack setup
+├── DOCKER.md           # Docker documentation
+└── README.md           # This file
+```
+
 ## Transport Types
 
-### WebSocket Transport
-Traditional WebSocket-based OCPP communication, now using the transport interface for better abstraction and consistency.
-
 ### Redis Transport
-Redis-based OCPP communication for distributed architectures where clients and servers may be on different machines or need to scale horizontally.
+Redis-based OCPP communication for distributed architectures where clients and servers may be on different machines or need to scale horizontally. Examples are organized in separate `client/` and `server/` directories for clear separation.
+
+This directory focuses on Redis transport examples demonstrating the transport abstraction layer capabilities.
 
 ## Usage
 
-### WebSocket Examples
+### Docker Compose Stack (Recommended)
 
-#### Server
+The easiest way to run and test the transport examples is using Docker Compose:
+
 ```bash
-cd example/transport/websocket
-go run server.go
+cd example/transport
 
-# With custom port
-PORT=9000 go run server.go
+# Start the complete stack (Redis + Server + Client)
+docker-compose up -d
+
+# View logs from all services
+docker-compose logs -f
+
+# View logs from specific services
+docker-compose logs -f ocpp-server
+docker-compose logs -f ocpp-client
+
+# Monitor Redis activity via web UI
+# Open http://localhost:47002 in your browser
+
+# Stop the stack
+docker-compose down
 ```
 
-#### Client
+**Stack includes:**
+- Redis server (port 47001)
+- OCPP server using Redis transport
+- OCPP client using Redis transport
+
+See [DOCKER.md](DOCKER.md) for complete documentation.
+
+### Manual Docker Commands
+
+If you prefer to run services individually:
+
 ```bash
-cd example/transport/websocket
-go run client.go
+# Start Redis
+docker run -d -p 47001:6379 --name ocpp-redis redis:7-alpine
 
-# With custom server URL
-SERVER_URL=ws://localhost:9000/ws go run client.go
-```
+# Build and run server
+docker build -f redis/server/Dockerfile -t ocpp-redis-server ../../..
+docker run --link ocpp-redis:redis -e REDIS_ADDR=redis:6379 ocpp-redis-server
 
-### Redis Examples
-
-#### Prerequisites
-Start a Redis server:
-```bash
-# Using Docker
-docker run -d -p 6379:6379 redis:latest
-
-# Or install Redis locally and start it
-redis-server
-```
-
-#### Server
-```bash
-cd example/transport/redis
-go run server.go
-
-# With custom Redis configuration
-REDIS_ADDR=localhost:6380 REDIS_PASSWORD=mypassword go run server.go
-```
-
-#### Client
-```bash
-cd example/transport/redis
-go run client.go
-
-# With custom Redis configuration
-REDIS_ADDR=localhost:6380 REDIS_PASSWORD=mypassword go run client.go
+# Build and run client
+docker build -f redis/client/Dockerfile -t ocpp-redis-client ../../..
+docker run --link ocpp-redis:redis -e REDIS_ADDR=redis:6379 ocpp-redis-client
 ```
 
 ## Key Differences from Legacy Examples
@@ -71,16 +87,19 @@ These examples use the new transport abstraction:
 **Server:**
 ```go
 // Create transport
-factory := websocket.NewWebSocketFactory()
-config := &transport.WebSocketConfig{Port: 8887, ListenPath: "/ws/{id}"}
-wsTransport, _ := factory.CreateTransport(config)
+factory := redis.NewRedisFactory()
+config := &transport.RedisConfig{
+    Addr:          "localhost:6379",
+    ChannelPrefix: "ocpp",
+}
+redisTransport, _ := factory.CreateTransport(config)
 
 // Create server with transport
-server := ocppj.NewServerWithTransport(wsTransport, nil, nil, ocpp16.Profile)
+server := ocppj.NewServerWithTransport(redisTransport, nil, nil, ocpp16.Profile)
 
 // Use transport-compatible handlers
 server.SetTransportRequestHandler(func(clientID string, request ocpp.Request, requestId string, action string) {
-    // Handle request using clientID string instead of ws.Channel
+    // Handle request using clientID string for Redis transport
 })
 
 // Start with context and config
@@ -91,43 +110,65 @@ server.StartWithTransport(ctx, config)
 **Client:**
 ```go
 // Create transport
-factory := websocket.NewWebSocketFactory()
-config := &transport.WebSocketConfig{}
-wsTransport, _ := factory.CreateClientTransport(config)
+factory := redis.NewRedisFactory()
+config := &transport.RedisConfig{
+    Addr:          "localhost:6379",
+    ChannelPrefix: "ocpp",
+}
+redisTransport, _ := factory.CreateClientTransport(config)
 
 // Create client with transport
-client := ocppj.NewClientWithTransport("client-id", wsTransport, nil, nil, ocpp16.Profile)
+client := ocppj.NewClientWithTransport("client-id", redisTransport, nil, nil, ocpp16.Profile)
 
-// Start with context and config
+// Start with context and config (endpoint empty for Redis)
 ctx := context.Background()
-client.StartWithTransport(ctx, "ws://localhost:8887/ws", config)
+client.StartWithTransport(ctx, "", config)
 ```
 
-### Legacy WebSocket API (Deprecated)
+### Legacy API Comparison
 
-The old API still works for backward compatibility:
+The transport abstraction provides benefits over direct usage:
 
 ```go
-// Legacy server creation (deprecated)
-wsServer := ws.NewServer()
-server := ocppj.NewServer(wsServer, nil, nil, ocpp16.Profile)
+// Direct Redis usage (more complex)
+redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+// Manual message envelope handling, queue management, etc.
 
-// Legacy client creation (deprecated)
-wsClient := ws.NewClient()
-client := ocppj.NewClient("client-id", wsClient, nil, nil, ocpp16.Profile)
+// Transport abstraction (simplified)
+factory := redis.NewRedisFactory()
+config := &transport.RedisConfig{Addr: "localhost:6379"}
+transport, _ := factory.CreateTransport(config)
+// Automatic message handling, connection management, etc.
 ```
 
 ## Benefits of Transport Abstraction
 
 1. **Unified API**: Same OCPPJ interface works with any transport
-2. **Pluggable Transports**: Easy to switch between WebSocket, Redis, or future transports
+2. **Pluggable Transports**: Easy to switch between Redis and future transports
 3. **Better Testing**: Mock transports for unit testing
 4. **Scalability**: Redis transport enables horizontal scaling
 5. **Cloud-Native**: Better suited for containerized and distributed deployments
 
+## Key Improvements
+
+### Redis Transport Message Handling
+The Redis transport now properly handles `MessageEnvelope` structures:
+
+- **Server**: Wraps OCPP-J messages in `MessageEnvelope` for Redis queues
+- **Client**: Automatically extracts OCPP-J payload from `MessageEnvelope`
+- **Compatibility**: Works seamlessly with existing OCPP message parsing
+- **Client ID Handling**: Redis transport uses client ID directly (not WebSocket URLs)
+
+### Clean Directory Structure
+Examples are now organized in separate directories to eliminate IDE conflicts:
+
+- **No conflicts**: Each example has its own `main()` function
+- **Clean builds**: Individual Docker builds for client and server
+- **Better organization**: Focused documentation for each component
+
 ## Message Flow
 
-Both WebSocket and Redis examples demonstrate the same OCPP message flow:
+The Redis transport examples demonstrate the standard OCPP message flow:
 
 1. **Client Connection**: Client connects to server
 2. **Boot Notification**: Client sends boot notification, server responds
@@ -137,13 +178,19 @@ Both WebSocket and Redis examples demonstrate the same OCPP message flow:
 
 ## Environment Variables
 
-### WebSocket Examples
-- `PORT`: Server listen port (default: 8887)
-- `SERVER_URL`: Client server URL (default: ws://localhost:8887/ws)
+### Docker Compose Configuration
+The docker-compose stack uses these environment variables:
 
-### Redis Examples
-- `REDIS_ADDR`: Redis server address (default: localhost:6379)
+#### Redis Transport
+- `REDIS_ADDR`: Redis server address (default: redis:6379)
 - `REDIS_PASSWORD`: Redis password (optional)
+- `CLIENT_ID`: Charge point identifier (default: CP-001)
+- `OCPP_CHANNEL_PREFIX`: Redis key prefix (default: ocpp)
+- `OCPP_CLIENT_TIMEOUT`: Client timeout (default: 30s)
+- `OCPP_STATE_TTL`: State TTL (default: 300s)
+
+#### Ports Used
+- `47001`: Redis server
 
 ## Error Handling
 
@@ -151,10 +198,30 @@ All examples include proper error handling and graceful shutdown using context c
 
 ## Production Considerations
 
-For production use, consider:
+For production deployments using Docker:
 
-1. **Security**: Use TLS for WebSocket, Redis AUTH for Redis
-2. **Monitoring**: Add metrics and health checks
-3. **Logging**: Use structured logging (e.g., logrus, zap)
-4. **Configuration**: Use proper configuration management
-5. **Testing**: Add integration tests with real transports
+1. **Security**:
+   - Enable Redis AUTH with strong passwords
+   - Use Docker secrets for sensitive configuration
+   - Run containers with non-root users
+   - Secure Redis with TLS if needed
+
+2. **Monitoring**:
+   - Health checks are included in docker-compose
+   - Add Prometheus/Grafana for metrics
+   - Use structured logging with log aggregation
+
+3. **Scalability**:
+   - Scale Redis transport services with `docker-compose up --scale ocpp-server=3`
+   - Use Redis Cluster for high availability
+   - Multiple servers can process from the same Redis instance
+
+4. **Configuration**:
+   - Use `.env` files for environment-specific settings
+   - Mount configuration files as volumes
+   - Use Docker Swarm or Kubernetes for orchestration
+
+5. **Testing**:
+   - Integration tests with real Redis instances
+   - Load testing with multiple clients
+   - Chaos engineering with container failures
